@@ -1,5 +1,7 @@
 #include "softmax.h"
 
+#include <cstdint>
+
 #include "reduction.cuh"
 #include "util/cuda_utils.h"
 

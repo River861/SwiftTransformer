@@ -46,7 +46,7 @@ void naiveGemmStridedBatched(
 					T b_elem = transb == CUBLAS_OP_N ? Barray[batch * stride_b + l * ldb + j] : Barray[batch * stride_b + j * ldb + l];
 					sum = sum + (float)a_elem*(float)b_elem;
 				}
-				Carray[batch * stride_c + i * ldc + j] = alpha * sum + beta * Carray[batch * stride_c + i * ldc + j];
+				Carray[batch * stride_c + i * ldc + j] = (float)alpha * sum + (float)beta * (float)Carray[batch * stride_c + i * ldc + j];
 			}
 		}
 	}

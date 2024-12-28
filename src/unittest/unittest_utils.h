@@ -90,7 +90,7 @@ inline bool isArrayAlmostEqual(
 			if (error_count > max_non_match && error_count < max_non_match+4) {
 				printf("Invalid result: answer[%ld] = %f, reference[%ld] = %f, abs_err = %f, rel_err = %f\n",
 					i, (float)answer[i], i, (float)reference[i],
-					fabs(answer[i]-reference[i]), fabs(answer[i]-reference[i])/fabs(reference[i]));
+					fabs((float)(answer[i]-reference[i])), fabs((float)(answer[i]-reference[i]))/fabs((float)reference[i]));
 			}
 		}
 	}

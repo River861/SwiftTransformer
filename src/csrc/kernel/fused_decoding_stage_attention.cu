@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdint>
 
 #include "util/cuda_utils.h"
 
