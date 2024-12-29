@@ -240,6 +240,7 @@ void GptWeight<T>::loadTensor_all(T* to_ptr, const std::string model_dir, const 
 	}
 	torch::jit::Module tmp = torch::jit::load(tensor_path, torch::kCPU);
 	torch::Tensor tmp_tensor = tmp.attr(key).toTensor();
+	assert(tmp_tensor.is_contiguous());
 	if (tmp_tensor.numel() != expect_size){
 		std::cerr << "Gpt<T>::load() - " << tensor_path << " size not match" << std::endl;
 		throw std::runtime_error("");
