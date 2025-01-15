@@ -33,7 +33,7 @@ private:
 
 	// Buffers for input indexing
 	RemallocableArray<int64_t> ith_context_req_req_index;	// [batch_size]
-	RemallocableArray<int32_t> ith_context_req_token_index;	// [batch_size]
+	RemallocableArray<int32_t> ith_context_req_token_index;	// [batch_size+1]
 	RemallocableArray<int64_t> ith_decoding_req_req_index;	// [batch_size]
 	RemallocableArray<int64_t> ith_decoding_req_token_index;// [batch_size]
 

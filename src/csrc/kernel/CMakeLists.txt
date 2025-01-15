@@ -19,15 +19,20 @@ add_library(kernel STATIC
 target_link_libraries(kernel PUBLIC util)
 set_property(TARGET kernel PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-file(GLOB xformers_autogen_impl_files ${CMAKE_CURRENT_SOURCE_DIR}/xformers/xformers/csrc/attention/cuda/fmha/autogen/impl/*.cu)
-add_library(xformers_autogen_impl STATIC ${xformers_autogen_impl_files})
-target_include_directories(xformers_autogen_impl PUBLIC xformers/third_party/cutlass/include)
-set_property(TARGET xformers_autogen_impl PROPERTY POSITION_INDEPENDENT_CODE ON)
+file(GLOB flash_attn_impl_cu_files ${CMAKE_CURRENT_SOURCE_DIR}/flash-attention/csrc/flash_attn/src/flash_fwd_*_fp16_causal_*.cu)
+message("flash_attn_impl_cu_files=${flash_attn_impl_cu_files}")
 
-add_library(xformers_kernel STATIC
-	xformers_attention.cu
+
+add_library(flash_attn_impl STATIC ${flash_attn_impl_cu_files})
+target_include_directories(flash_attn_impl PUBLIC flash-attention/csrc/cutlass/include)
+set_property(TARGET flash_attn_impl PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+add_library(flash_attn_context_stage_attention STATIC
+	flash_attn_context_stage_attention.cu
 )
-target_include_directories(xformers_kernel PUBLIC xformers/third_party/cutlass/include)
-target_link_libraries(xformers_kernel PUBLIC util xformers_autogen_impl)
-set_property(TARGET xformers_kernel PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_include_directories(flash_attn_context_stage_attention PRIVATE flash-attention/csrc/cutlass/include)
+target_include_directories(flash_attn_context_stage_attention PRIVATE flash-attention/csrc/flash_attn/src)
+target_link_libraries(flash_attn_context_stage_attention PUBLIC util flash_attn_impl)
+set_property(TARGET flash_attn_context_stage_attention PROPERTY POSITION_INDEPENDENT_CODE ON)
 
+target_link_libraries(kernel PUBLIC flash_attn_context_stage_attention)

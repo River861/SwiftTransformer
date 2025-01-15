@@ -240,6 +240,16 @@ void Gpt<T>::forwardDecoder(
 		throw std::runtime_error("Gpt::forwardDecoder: is_pre_layernorm must be true");
 	}
 
+	// Check whether all context requests are before all decoding requests
+	bool met_decoding_reqs = false;
+	for (int64_t i = 0; i < batch_size; ++i) {
+		if (h_is_context_stage[i] == false) {
+			met_decoding_reqs = true;
+		} else if (met_decoding_reqs) {
+			throw std::runtime_error("All context requests must be before all decoding requests");
+		}
+	}
+
 	// Calculate the number of tokens and max_input_len
 	int64_t num_tokens = 0;
 	for (int64_t i = 0; i < batch_size; ++i) {
@@ -287,7 +297,7 @@ void Gpt<T>::forwardDecoder(
 			cur_token_index += 1;
 		}
 	}
-	ith_context_req_token_index_cpu[num_context_reqs] = num_tokens;
+	ith_context_req_token_index_cpu[num_context_reqs] = num_tokens - num_decoding_reqs;
 
 	// Copy the indexes to GPU
 	// TODO These memcpys are blocking calls which forces a synchronization. Optimize it.

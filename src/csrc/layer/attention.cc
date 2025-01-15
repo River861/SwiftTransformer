@@ -6,12 +6,13 @@
 #include "kernel/rotary_posi_embedding.h"
 #include "kernel/softmax.h"
 #include "kernel/unfused_attention.h"
+#include "kernel/flash_attn_context_stage_attention.h"
 #include "kernel/fused_context_stage_attention.h"
 #include "kernel/fused_decoding_stage_attention.h"
 #include "kernel/kvcache_mgmt.h"
-#include "kernel/xformers_attention.h"
 #include "util/cublas_wrapper.h"
 #include "util/cuda_utils.h"
+#include "util/debug_utils.h"
 
 namespace st::layer {
 
@@ -176,25 +177,18 @@ void attention(
 		);
 		sync_check_cuda_error();
 
-		if (local_q_head_num == local_kv_head_num && std::is_same_v<T, half>) {
-			// Use xformers' attention kernel when GQA (group query attention) is disabled
-			kernel::xformersContextStageAttention<T>(
-				attn_out_buf,
-				qkv_buf,
-				qk_scale,
-				input_len,
-				num_context_reqs,
-				ith_context_req_req_index,
-				ith_context_req_token_index,
-				local_q_head_num,
-				local_kv_head_num,
-				head_dim,
-				num_tokens,
-				max_context_req_len
-			);
-			sync_check_cuda_error();
-		} else {
-			// If GQA is enabled we use our own context stage attention kernel
+		bool can_use_flash_attn = true;
+		if (!std::is_same_v<T, half>) {
+			// FlashAttention is not supported for fp32
+			can_use_flash_attn = false;
+			static bool warning_printed = false;
+			if (!warning_printed) {
+				std::cerr << "Warning: FlashAttention is disabled since the data type is not half" << std::endl;
+				warning_printed = true;
+			}
+		}
+
+		if (!can_use_flash_attn) {
 			kernel::fusedContextStageAttention<T>(
 				attn_out_buf,
 
@@ -214,6 +208,26 @@ void attention(
 				context_stage_kernel_l_buf
 			);
 			sync_check_cuda_error();
+		} else {
+			// Use flash attn
+			if constexpr(std::is_same_v<T, half>) {	
+				int num_context_stage_tokens = num_tokens - num_decoding_reqs;
+				kernel::flashAttentionContextStageAttention(
+					attn_out_buf,
+					qkv_buf,
+					ith_context_req_token_index,
+					qk_scale,
+					num_q_heads,
+					num_kv_heads,
+					head_dim,
+					num_context_reqs,
+					max_context_req_len,
+					num_context_stage_tokens
+				);
+			} else {
+				// Should never reach here
+				assert_whenever(false);
+			}
 		}
 	}
 
