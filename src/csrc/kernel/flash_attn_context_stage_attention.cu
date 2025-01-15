@@ -535,33 +535,26 @@ void flashAttentionContextStageAttention(
     const int max_context_req_len,
     const int num_context_stage_tokens
 ) {
-    auto getTensor = [](void* data, torch::IntArrayRef sizes, const std::vector<int64_t> &dimension_strides, torch::ScalarType dtype, torch::Device device = torch::kCUDA) {
-        const int64_t dim = dimension_strides.size();
-        std::vector<int64_t> strides(dim);
-        for (int64_t i = dim-1; i >= 0; --i) {
-            int64_t last_dim_stride = i == dim-1 ? 1 : strides[i+1];
-            int64_t last_dim_size = i == dim-1 ? 1 : sizes[i+1];
-            strides[i] = last_dim_stride * last_dim_size * dimension_strides[i];
-        }
+    auto getTensor = [](void* data, torch::IntArrayRef sizes, const std::vector<int64_t> &strides, torch::ScalarType dtype, torch::Device device = torch::kCUDA) {
         auto options = torch::TensorOptions().dtype(dtype).device(device);
         return torch::from_blob(data, sizes, strides, [](void*) {}, options);
     };
     at::Tensor q_tensor = getTensor(
         const_cast<half*>(qkvs),
         { num_context_stage_tokens, num_q_heads, head_dim },
-        { 3, 1, 1 },
+        { (num_q_heads+2*num_kv_heads)*head_dim, head_dim, 1 },
         torch::kHalf
     );
     at::Tensor k_tensor = getTensor(
         const_cast<half*>(qkvs) + num_q_heads * head_dim,
         { num_context_stage_tokens, num_kv_heads, head_dim },
-        { 3, 1, 1 },
+        { (num_q_heads+2*num_kv_heads)*head_dim, head_dim, 1 },
         torch::kHalf
     );
     at::Tensor v_tensor = getTensor(
         const_cast<half*>(qkvs) + (num_q_heads+num_kv_heads) * head_dim,
         { num_context_stage_tokens, num_kv_heads, head_dim },
-        { 3, 1, 1 },
+        { (num_q_heads+2*num_kv_heads)*head_dim, head_dim, 1 },
         torch::kHalf
     );
     at::Tensor seqstart = getTensor(
@@ -573,7 +566,7 @@ void flashAttentionContextStageAttention(
     at::Tensor result_tensor = getTensor(
         result,
         { num_context_stage_tokens, num_q_heads, head_dim },
-        { 1, 1, 1 },
+        { num_q_heads*head_dim, head_dim, 1 },
         torch::kHalf
     );
 
