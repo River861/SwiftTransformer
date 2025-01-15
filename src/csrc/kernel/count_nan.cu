@@ -1,6 +1,7 @@
 #include "count_nan.h"
 
 #include <cassert>
+#include <cstdint>
 
 #include "util/cuda_utils.h"
 
