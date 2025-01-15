@@ -78,7 +78,6 @@ template<
 	const int64_t kv_head_index = blockIdx.x/thread_blocks_per_kv_head;
 
 	const int64_t my_q_head_begin = blockIdx.x*Q_HEADS_PER_THREAD_BLOCK;
-	const int64_t my_q_head_end = (blockIdx.x+1)*Q_HEADS_PER_THREAD_BLOCK;
 
 	const int64_t warp_id = threadIdx.x / WARP_SIZE;
 	const int64_t lane_id = threadIdx.x % WARP_SIZE;
