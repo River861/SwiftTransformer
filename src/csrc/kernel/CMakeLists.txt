@@ -19,7 +19,7 @@ add_library(kernel STATIC
 target_link_libraries(kernel PUBLIC util)
 set_property(TARGET kernel PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-file(GLOB flash_attn_impl_cu_files ${CMAKE_CURRENT_SOURCE_DIR}/flash-attention/csrc/flash_attn/src/flash_fwd_*_fp16_causal_*.cu)
+file(GLOB flash_attn_impl_cu_files ${CMAKE_CURRENT_SOURCE_DIR}/flash-attention/csrc/flash_attn/src/flash_fwd_*_fp16_*.cu)
 message("flash_attn_impl_cu_files=${flash_attn_impl_cu_files}")
 
 
