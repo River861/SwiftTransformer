@@ -173,9 +173,9 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
                 if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
-                    run_mha_fwd_<cutlass::half_t, kHeadDim, true>(params, stream);
+                    run_mha_fwd_<cutlass::half_t, kHeadDim, Is_causal>(params, stream);
                 } else {
-                    run_mha_fwd_splitkv_dispatch<cutlass::half_t, kHeadDim, true>(params, stream);
+                    run_mha_fwd_splitkv_dispatch<cutlass::half_t, kHeadDim, Is_causal>(params, stream);
                 }
             });
         });
