@@ -44,7 +44,7 @@ constexpr int64_t DEFAULT_THREAD_BLOCK_SIZE = 256;
 
 template<
 	typename T,
-	int64_t Q_HEADS_PER_THREAD_BLOCK,
+	int64_t Q_HEADS_PER_KV_HEAD,
 	int64_t HEAD_DIM,
 	int64_t BLOCK_SIZE,
 	int64_t THREAD_BLOCK_SIZE
@@ -67,205 +67,256 @@ template<
 	const int64_t* __restrict__ ith_decoding_req_req_index,	// [num_decoding_reqs]
 	const int64_t* __restrict__ ith_decoding_req_token_index,	// [num_decoding_reqs]
 	const int64_t max_num_block_per_seq,
-	const int64_t num_layers,
-	const int64_t num_kv_heads
+	const int64_t num_layers
 ) {
+	constexpr int64_t NUM_THREAD_PER_KEY = WARP_SIZE / BLOCK_SIZE;	// The size of the thread group
+	constexpr int64_t THREAD_GROUP_SIZE = NUM_THREAD_PER_KEY;		// Just an alias
 	constexpr int64_t NUM_WARPS = THREAD_BLOCK_SIZE / WARP_SIZE;
+	constexpr int64_t NUM_ELEM_PER_THREAD = (HEAD_DIM/2) / NUM_THREAD_PER_KEY;
+	typedef std::conditional_t<std::is_same<T, half>::value, half2, float2> T2;
 
-	// Grid: num_q_heads/Q_HEADS_PER_THREAD_BLOCK x num_decoding_reqs
-	const int64_t num_q_heads = gridDim.x*Q_HEADS_PER_THREAD_BLOCK;
-	const int64_t thread_blocks_per_kv_head = (num_q_heads/num_kv_heads)/Q_HEADS_PER_THREAD_BLOCK;
-	const int64_t kv_head_index = blockIdx.x/thread_blocks_per_kv_head;
-
-	const int64_t my_q_head_begin = blockIdx.x*Q_HEADS_PER_THREAD_BLOCK;
-
-	const int64_t warp_id = threadIdx.x / WARP_SIZE;
-	const int64_t lane_id = threadIdx.x % WARP_SIZE;
+	const int64_t q_head_id = blockIdx.x;		// Grid: num_q_heads x num_decoding_reqs
+	const int64_t kv_head_id = q_head_id / Q_HEADS_PER_KV_HEAD;
+	const int64_t num_q_heads = gridDim.x;	// TODO Pass it as a template parameter to save a register
+	const int64_t num_kv_heads = num_q_heads / Q_HEADS_PER_KV_HEAD;
 
 	const int64_t req_index = ith_decoding_req_req_index[blockIdx.y];
 	const int64_t token_index = ith_decoding_req_token_index[blockIdx.y];
 	const int64_t input_len = input_lens[req_index];	// Here input_lens DOES NOT INCLUDE the latest token!
-	const int64_t num_blocks = (input_len+1 + BLOCK_SIZE-1) / BLOCK_SIZE;
+	const int64_t num_blocks = (input_len+1 + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-	// We organize threads into thread groups. When calculating attn_mat*V, each element
-	// in the final result is calculated by one thread group
-	constexpr int64_t THREAD_GROUP_SIZE = 8;	// TODO Tune this
-	constexpr int64_t NUM_THREAD_GROUPS = THREAD_BLOCK_SIZE / THREAD_GROUP_SIZE;
-	const int64_t thread_group_id = threadIdx.x / THREAD_GROUP_SIZE;
-	const int64_t thread_group_offset = threadIdx.x % THREAD_GROUP_SIZE;
+	const int64_t warp_id = threadIdx.x / WARP_SIZE;	// Which warp we are in
+	const int64_t lane_id = threadIdx.x % WARP_SIZE;
+	const int64_t thread_group_id = lane_id / NUM_THREAD_PER_KEY;	// Which thread group we are in, i.e. which column in K^T we are responsible for
+	const int64_t thread_id_in_group = lane_id % NUM_THREAD_PER_KEY;	// Which thread we are in the thread group
+
+	extern __shared__ float shared_mem[];
+	float* attn_score = shared_mem; // [\lceil max_input_len/BLOCK_SIZE \rceil * BLOCK_SIZE]
+	T2* qkv_reduction_wksp = (T2*)shared_mem;	// [NUM_WARPS, WARP_SIZE]
+	__shared__ float reduction_wksp[32];	// Workspace for reduction. Here 32 >= NUM_WARPS
 
 	// Step 0: Save the KV cache
-	if (threadIdx.x < HEAD_DIM && blockIdx.x%thread_blocks_per_kv_head == 0) {
+	if (threadIdx.x < HEAD_DIM) {
 		int64_t kvcache_index = INDEX_5D(
 			0, num_layers, num_kv_heads, BLOCK_SIZE, HEAD_DIM,
 			block_table[INDEX_2D(0, max_num_block_per_seq, req_index, input_len/BLOCK_SIZE)],
-			0, kv_head_index, input_len%BLOCK_SIZE, threadIdx.x
+			0, kv_head_id, input_len%BLOCK_SIZE, threadIdx.x
 		);
-		k_cache_offseted[kvcache_index] = qkvs[INDEX_3D(0, num_q_heads+2*num_kv_heads, HEAD_DIM, token_index, num_q_heads+kv_head_index, threadIdx.x)];
-		v_cache_offseted[kvcache_index] = qkvs[INDEX_3D(0, num_q_heads+2*num_kv_heads, HEAD_DIM, token_index, num_q_heads+num_kv_heads+kv_head_index, threadIdx.x)];
+		k_cache_offseted[kvcache_index] = qkvs[INDEX_3D(0, num_q_heads+2*num_kv_heads, HEAD_DIM, token_index, num_q_heads + kv_head_id, threadIdx.x)];
+		v_cache_offseted[kvcache_index] = qkvs[INDEX_3D(0, num_q_heads+2*num_kv_heads, HEAD_DIM, token_index, num_q_heads + num_kv_heads + kv_head_id, threadIdx.x)];
 	}
 	__syncthreads();	// Since we are going to use k_cache and v_cache later
 
-	__shared__ T q_buf[Q_HEADS_PER_THREAD_BLOCK][HEAD_DIM];
-	__shared__ T k_block[BLOCK_SIZE][HEAD_DIM];
-	__shared__ float attn_score[Q_HEADS_PER_THREAD_BLOCK][BLOCK_SIZE];	// TODO Transpose this to avoid bank conflict.
-	__shared__ T v_block[BLOCK_SIZE][HEAD_DIM];
-	__shared__ float mi[Q_HEADS_PER_THREAD_BLOCK], li[Q_HEADS_PER_THREAD_BLOCK];
-	__shared__ float mult_old_elem[Q_HEADS_PER_THREAD_BLOCK], mult_new_elem[Q_HEADS_PER_THREAD_BLOCK];
-	__shared__ float result_buf[Q_HEADS_PER_THREAD_BLOCK][HEAD_DIM];
-
-	// Step 0: Initialize variables
-	if (threadIdx.x < Q_HEADS_PER_THREAD_BLOCK) {
-		mi[threadIdx.x] = -__FLT_MAX__;
-		li[threadIdx.x] = 0;
-	}
+	// Step 1: Load q into registers
+	// 
+	// We do this since we must multiply q with every column in K^T, and we can save a lot of
+	// global memory access by doing this.
+	// 
+	// To leverage the memory coalescing, the i-th thread in the thread group
+	// is responsible for q[i], q[i+THREAD_GROUP_SIZE], and so on.
+	T2 q_cache[NUM_ELEM_PER_THREAD];
 	#pragma unroll
-	for (int64_t i = threadIdx.x; i < Q_HEADS_PER_THREAD_BLOCK*HEAD_DIM; i += blockDim.x) {
-		q_buf[i/HEAD_DIM][i%HEAD_DIM] = qkvs[INDEX_3D(
-			0, num_q_heads+2*num_kv_heads, HEAD_DIM,
-			token_index, my_q_head_begin+i/HEAD_DIM, i%HEAD_DIM
-		)];
-		result_buf[i/HEAD_DIM][i%HEAD_DIM] = 0.0;
+	for (int64_t i = 0; i < NUM_ELEM_PER_THREAD; i++) {
+		q_cache[i] = ((const T2 *)qkvs)[INDEX_3D(0, num_q_heads+2*num_kv_heads, HEAD_DIM/2, token_index, q_head_id, thread_id_in_group + i*THREAD_GROUP_SIZE)];
+	}
+
+	// Variables for softmax-ing
+	float max_qki = -__FLT_MAX__;
+
+	// Iterate over all blocks
+	for (int64_t block_idx = warp_id; block_idx < num_blocks; block_idx += NUM_WARPS) {
+		const int64_t block_index = block_table[req_index*max_num_block_per_seq + block_idx];
+		const T2* k_block = (const T2*)(k_cache_offseted + (block_index*num_layers*num_kv_heads + kv_head_id)*BLOCK_SIZE*HEAD_DIM);
+		const int64_t token_idx = block_idx*BLOCK_SIZE + thread_group_id;
+
+		// Step 2: Calculate qkij
+		float qkij = 0;
+		#pragma unroll
+		for (int64_t i = 0; i < NUM_ELEM_PER_THREAD; ++i) {
+			const T2 q_elem = q_cache[i];
+			const T2 k_elem = k_block[INDEX_2D(0, HEAD_DIM/2, thread_group_id, thread_id_in_group + i*NUM_THREAD_PER_KEY)];
+			qkij += (float)(q_elem.x * k_elem.x + q_elem.y * k_elem.y);
+		}
+
+		// Step 3: Reduce qkij to get qki
+		float qki = qkij;
+		#pragma unroll
+		for (int64_t mask = THREAD_GROUP_SIZE/2; mask; mask >>= 1) {
+			qki += __shfl_xor_sync(0xffffffff, qki, mask);
+		}
+		// Now all threads with thread_id_in_group == 0 has the correct value of qki
+		if (thread_id_in_group == 0) {
+			qki = token_idx <= input_len ? qki*qk_scale : -__FLT_MAX__;
+			max_qki = fmaxf(max_qki, qki);
+			attn_score[token_idx] = qki;
+		}
+	}
+
+	// Step 4: Perform reduction on max_qki within each warp
+	#pragma unroll
+	for (int mask = WARP_SIZE/2; mask >= THREAD_GROUP_SIZE; mask >>= 1) {
+		max_qki = fmaxf(max_qki, __shfl_xor_sync(0xffffffff, max_qki, mask));
+	}
+	// Now all threads with lane == 0 has max_qki = max(qki | i is in the same warp)
+	if (lane_id == 0) {
+		reduction_wksp[warp_id] = max_qki;
 	}
 	__syncthreads();
 
-	// Now we iterate over each k/v block, copy them to shared memory, calculate attention score
-	// and modify result_buf[]
-	for (int64_t kv_block_idx = 0; kv_block_idx < num_blocks; kv_block_idx += 1) {
-		int64_t kv_block_index = block_table[req_index*max_num_block_per_seq + kv_block_idx];
-
-		// Step 1. Copy k/v to shared memory
+	// Step 5: Perform reduction on max_qki within the whole thread group
+	if (warp_id == 0) {
+		max_qki = lane_id < NUM_WARPS ? reduction_wksp[lane_id] : -__FLT_MAX__;
 		#pragma unroll
-		for (int64_t i = threadIdx.x; i < BLOCK_SIZE*HEAD_DIM; i += blockDim.x) {
-			int64_t block_size_index = i/HEAD_DIM;
-			int64_t head_dim_index = i%HEAD_DIM;
-			bool is_valid = kv_block_idx*BLOCK_SIZE + block_size_index < input_len+1;
-			int64_t kvcache_index = INDEX_5D(
-				0, num_layers, num_kv_heads, BLOCK_SIZE, HEAD_DIM,
-				kv_block_index, 0, kv_head_index, block_size_index, head_dim_index
-			);
-			k_block[i/HEAD_DIM][i%HEAD_DIM] = is_valid ? k_cache_offseted[kvcache_index] : (T)0.0;
-			v_block[i/HEAD_DIM][i%HEAD_DIM] = is_valid ? v_cache_offseted[kvcache_index] : (T)0.0;
+		for (int mask = NUM_WARPS/2; mask; mask >>= 1) {
+			max_qki = fmaxf(max_qki, __shfl_xor_sync(0xffffffff, max_qki, mask));
 		}
-		__syncthreads();
+		// Now thread #0 has the correct max_qki
+		if (lane_id == 0) {
+			reduction_wksp[0] = max_qki;
+		}
+	}
+	__syncthreads();
 
-		// Step 2. Calculate attention score
-		// Each warp calculates some elements in the attention matrix
-		// And by the way we scale it by qk_scale
-		#pragma unroll
-		for (int64_t attn_mat_elem_index = warp_id; attn_mat_elem_index < Q_HEADS_PER_THREAD_BLOCK*BLOCK_SIZE; attn_mat_elem_index += NUM_WARPS) {
-			int64_t block_size_index = attn_mat_elem_index / Q_HEADS_PER_THREAD_BLOCK;
-			int64_t q_head_index = attn_mat_elem_index % Q_HEADS_PER_THREAD_BLOCK;
-			float result = 0.0f;
-			#pragma unroll
-			for (int64_t hd_index = lane_id; hd_index < HEAD_DIM; hd_index += WARP_SIZE) {
-				result += (float)(q_buf[q_head_index][hd_index] * k_block[block_size_index][hd_index]);
-			}
-			// Reduction within the warp to calculate the result
-			#pragma unroll
-			for (int offset = WARP_SIZE/2; offset > 0; offset /= 2) {
-				result += __shfl_down_sync(0xffffffff, result, offset);
-			}
-			if (lane_id == 0) {
-				attn_score[q_head_index][block_size_index] = kv_block_idx*BLOCK_SIZE+block_size_index < input_len+1 ? result * qk_scale : -__FLT_MAX__;
-			}
-		}
-		__syncthreads();
+	// Step 6: Get the sum of exp(qki - max_qki)
+	max_qki = reduction_wksp[0];
+	float sum_exp_qki = 0;
+	#pragma unroll
+	for (int i = threadIdx.x; i < num_blocks*BLOCK_SIZE; i += THREAD_BLOCK_SIZE) {
+		float val = __expf(attn_score[i] - max_qki);
+		sum_exp_qki += val;
+		attn_score[i] = val;
+	}
+	__syncthreads();
 
-		// Step 3. Calculate mij (the maximum value in every row in attn_score[])
-		// and lij (the sum of exp(x - mij) in attn_score[])
-		#pragma unroll
-		for (int64_t q_head_index = warp_id; q_head_index < Q_HEADS_PER_THREAD_BLOCK; q_head_index += NUM_WARPS) {
-			if (lane_id < BLOCK_SIZE) {
-				const uint32_t shfl_mask = (uint32_t)((1ull<<BLOCK_SIZE)-1);
-				float mij = attn_score[q_head_index][lane_id];
-				// Reduction to get mij
-				#pragma unroll
-				for (int offset = BLOCK_SIZE/2; offset > 0; offset /= 2) {
-					mij = max(mij, __shfl_xor_sync(shfl_mask, mij, offset));
-				}
-				float lij = attn_score[q_head_index][lane_id] = __expf(attn_score[q_head_index][lane_id] - mij);
-				// Reduction to get lij
-				#pragma unroll
-				for (int offset = BLOCK_SIZE/2; offset > 0; offset /= 2) {
-					lij += __shfl_down_sync(shfl_mask, lij, offset);
-				}
-				if (lane_id == 0) {
-					const float mi_new = fmaxf(mi[q_head_index], mij);
-					const float li_new = __expf(mi[q_head_index]-mi_new)*li[q_head_index] + __expf(mij-mi_new)*lij;
-					mult_old_elem[q_head_index] = __expf(mi[q_head_index]-mi_new);
-					mult_new_elem[q_head_index] = __expf(mij-mi_new);
-					mi[q_head_index] = mi_new;
-					li[q_head_index] = li_new;
-				}
-			}
-		}
-		__syncthreads();
+	// Perform reduction within warp
+	#pragma unroll
+	for (int mask = WARP_SIZE/2; mask; mask >>= 1) {
+		sum_exp_qki += __shfl_xor_sync(0xffffffff, sum_exp_qki, mask);
+	}
+	if (lane_id == 0) {
+		reduction_wksp[warp_id] = sum_exp_qki;
+	}
+	__syncthreads();
 
-		// Step 4. Calculate attn_score * v_block, and modify result
+	// Perform reduction within thread group
+	if (warp_id == 0) {
+		sum_exp_qki = lane_id < NUM_WARPS ? reduction_wksp[lane_id] : 0;
 		#pragma unroll
-		for (int64_t i = thread_group_id; i < Q_HEADS_PER_THREAD_BLOCK*HEAD_DIM; i += NUM_THREAD_GROUPS) {
-			int64_t q_head_index = i / HEAD_DIM;
-			int64_t hd_index = i % HEAD_DIM;
-			float cur_result = 0.0f;
-			#pragma unroll
-			for (int64_t block_size_index = thread_group_offset; block_size_index < BLOCK_SIZE; block_size_index += THREAD_GROUP_SIZE)
-				cur_result += (float)((T)attn_score[q_head_index][block_size_index] * v_block[block_size_index][hd_index]);
-			// Reduction within the thread group to calculate the result
-			#pragma unroll
-			for (int offset = THREAD_GROUP_SIZE/2; offset > 0; offset /= 2) {
-				cur_result += __shfl_down_sync(0xffffffff, cur_result, offset);
-			}
-			if (thread_group_offset == 0) {
-				result_buf[q_head_index][hd_index] = mult_old_elem[q_head_index]*result_buf[q_head_index][hd_index] + mult_new_elem[q_head_index]*cur_result;
-			}
+		for (int mask = NUM_WARPS/2; mask; mask >>= 1) {
+			sum_exp_qki += __shfl_xor_sync(0xffffffff, sum_exp_qki, mask);
 		}
-		__syncthreads();
+		if (lane_id == 0) {
+			reduction_wksp[0] = 1.0f / (sum_exp_qki + 1e-6f);
+		}
+	}
+	__syncthreads();
+
+	// Step 7: Calculate softmax
+	float softmax_denorm = reduction_wksp[0];
+	#pragma unroll
+	for (int token_index = threadIdx.x; token_index <= input_len; token_index += THREAD_BLOCK_SIZE) {
+		attn_score[token_index] *= softmax_denorm;
+	}
+	__syncthreads();
+
+	// Step 8: calculate attn_score * V
+	constexpr int64_t NUM_COL_PER_THREAD = (HEAD_DIM/2 + WARP_SIZE - 1) / WARP_SIZE;
+	T2 acc[NUM_COL_PER_THREAD];
+	#pragma unroll
+	for (int i = 0; i < NUM_COL_PER_THREAD; ++i) {
+		acc[i].x = acc[i].y = 0;
 	}
 
-	// Step -1 (the final step): Copy result_buf[] to result[]
-	if (warp_id < Q_HEADS_PER_THREAD_BLOCK) {
+	// Iterate over all blocks
+	#pragma unroll
+	for (int block_idx = warp_id; block_idx < num_blocks; block_idx += NUM_WARPS) {
+		const int64_t block_index = block_table[req_index*max_num_block_per_seq + block_idx];
+		const T2* v_block = (const T2*)(v_cache_offseted + (block_index*num_layers*num_kv_heads + kv_head_id)*BLOCK_SIZE*HEAD_DIM);
+		const int64_t token_idx = block_idx*BLOCK_SIZE;
+
 		#pragma unroll
-		for (int64_t hd_index = lane_id; hd_index < HEAD_DIM; hd_index += WARP_SIZE) {
-			result[INDEX_3D(
-				0, num_q_heads, HEAD_DIM,
-				token_index, my_q_head_begin+warp_id, hd_index
-			)] = result_buf[warp_id][hd_index] / (li[warp_id]+1e-6);
+		for (int col = lane_id; col < HEAD_DIM/2; col += WARP_SIZE) {
+			T2 acc_elem = acc[col/WARP_SIZE];
+			T sum_x = 0, sum_y = 0;
+			#pragma unroll
+			for (int i = 0; i < BLOCK_SIZE; i += 1) {
+				T attn_score_elem = (T)attn_score[token_idx + i];
+				T2 v_elem = v_block[INDEX_2D(BLOCK_SIZE, HEAD_DIM/2, i, col)];
+				sum_x += attn_score_elem * v_elem.x;
+				sum_y += attn_score_elem * v_elem.y;
+			}
+			acc[col/WARP_SIZE] = {acc_elem.x + sum_x, acc_elem.y + sum_y};
+		}
+	}
+	__syncthreads();
+
+	// Reduce accs among threads with the same lane_id
+	#pragma unroll
+	for (int i = 0; i < NUM_COL_PER_THREAD; ++i) {
+		// In the "Iterate over all blocks" above, each thread is responsible
+		// for column `lane_id`, `lane_id+WARP_SIZE`, `lane_id+2*WARP_SIZE`, ...
+
+		// Now we focus on col = i*WARP_SIZE + lane_id
+		// Copy the cols to the shared memory
+		{
+			int col = i*WARP_SIZE + lane_id;
+			if (col < HEAD_DIM/2) {
+				qkv_reduction_wksp[warp_id*WARP_SIZE + lane_id] = acc[i];
+			}
+			__syncthreads();
+		}
+
+		// Now our task is to, for every i in 0..WARP_SIZE-1,
+		// summing up qkv_reduction_wksp[0][i], qkv_reduction_wksp[1][i], ... qkv_reduction_wksp[NUM_WARPS-1][i]
+		// The i-th thread calculates the sum above for column threadIdx.x
+		{
+			const int thread_id = threadIdx.x;
+			if (thread_id < WARP_SIZE && i*WARP_SIZE + thread_id < HEAD_DIM/2) {
+				T sum_x = 0, sum_y = 0;
+				#pragma unroll
+				for (int j = 0; j < NUM_WARPS; ++j) {
+					const T2 elem = qkv_reduction_wksp[j*WARP_SIZE + thread_id];
+					sum_x += elem.x;
+					sum_y += elem.y;
+				}
+				((T2*)result)[INDEX_3D(0, num_q_heads, HEAD_DIM/2, token_index, q_head_id, i*WARP_SIZE + thread_id)] = {sum_x, sum_y};
+			}
+			__syncthreads();
 		}
 	}
 }
 
-#define LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_THREAD_BLOCK, HEAD_DIM, BLOCK_SIZE) \
-	fusedDecodingStageAttentionKernel<T, Q_HEADS_PER_THREAD_BLOCK, HEAD_DIM, BLOCK_SIZE, DEFAULT_THREAD_BLOCK_SIZE><<<grid_dim, DEFAULT_THREAD_BLOCK_SIZE>>>( \
-		result, qkvs, k_cache_offseted, v_cache_offseted, scale, block_table, input_lens, ith_decoding_req_req_index, ith_decoding_req_token_index, max_num_block_per_seq, num_layers, num_kv_heads \
+#define LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_KV_HEAD, HEAD_DIM, BLOCK_SIZE) \
+	fusedDecodingStageAttentionKernel<T, Q_HEADS_PER_KV_HEAD, HEAD_DIM, BLOCK_SIZE, DEFAULT_THREAD_BLOCK_SIZE><<<grid_dim, DEFAULT_THREAD_BLOCK_SIZE, shared_mem_size>>>( \
+		result, qkvs, k_cache_offseted, v_cache_offseted, scale, block_table, input_lens, ith_decoding_req_req_index, ith_decoding_req_token_index, max_num_block_per_seq, num_layers \
 	)
 
-#define FUSED_DECODING_STAGE_ATTENTION_DISPATCH_BLOCK_SIZE(T, Q_HEADS_PER_THREAD_BLOCK, HEAD_DIM) \
+#define FUSED_DECODING_STAGE_ATTENTION_DISPATCH_BLOCK_SIZE(T, Q_HEADS_PER_KV_HEAD, HEAD_DIM) \
 	switch (block_size) { \
-		case 1: LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_THREAD_BLOCK, HEAD_DIM, 1); break; \
-		case 2: LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_THREAD_BLOCK, HEAD_DIM, 2); break; \
-		case 4: LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_THREAD_BLOCK, HEAD_DIM, 4); break; \
-		case 8: LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_THREAD_BLOCK, HEAD_DIM, 8); break; \
-		case 16: LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_THREAD_BLOCK, HEAD_DIM, 16); break; \
-		case 32: LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_THREAD_BLOCK, HEAD_DIM, 32); break; \
+		case 1: LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_KV_HEAD, HEAD_DIM, 1); break; \
+		case 2: LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_KV_HEAD, HEAD_DIM, 2); break; \
+		case 4: LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_KV_HEAD, HEAD_DIM, 4); break; \
+		case 8: LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_KV_HEAD, HEAD_DIM, 8); break; \
+		case 16: LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_KV_HEAD, HEAD_DIM, 16); break; \
+		case 32: LAUNCH_DECODING_STAGE_ATTENTION_KERNEL(T, Q_HEADS_PER_KV_HEAD, HEAD_DIM, 32); break; \
 		default: fprintf(stderr, "Unsupported block_size: %ld\n", block_size); assert(0); \
 	}
 
-#define FUSED_DECODING_STAGE_ATTENTION_DISPATCH_HEAD_DIM(T, Q_HEADS_PER_THREAD_BLOCK) \
+#define FUSED_DECODING_STAGE_ATTENTION_DISPATCH_HEAD_DIM(T, Q_HEADS_PER_KV_HEAD) \
 	switch (head_dim) {	\
-		case 64: FUSED_DECODING_STAGE_ATTENTION_DISPATCH_BLOCK_SIZE(T, Q_HEADS_PER_THREAD_BLOCK, 64); break;	\
-		case 80: FUSED_DECODING_STAGE_ATTENTION_DISPATCH_BLOCK_SIZE(T, Q_HEADS_PER_THREAD_BLOCK, 80); break;	\
-		case 128: FUSED_DECODING_STAGE_ATTENTION_DISPATCH_BLOCK_SIZE(T, Q_HEADS_PER_THREAD_BLOCK, 128); break;	\
+		case 64: FUSED_DECODING_STAGE_ATTENTION_DISPATCH_BLOCK_SIZE(T, Q_HEADS_PER_KV_HEAD, 64); break;	\
+		case 80: FUSED_DECODING_STAGE_ATTENTION_DISPATCH_BLOCK_SIZE(T, Q_HEADS_PER_KV_HEAD, 80); break;	\
+		case 128: FUSED_DECODING_STAGE_ATTENTION_DISPATCH_BLOCK_SIZE(T, Q_HEADS_PER_KV_HEAD, 128); break;	\
 		default: fprintf(stderr, "Unsupported head_dim: %ld\n", head_dim); assert(0);			\
 	}
 
-#define FUSED_DECODING_STAGE_ATTENTION_DISPATCH_Q_HEADS_PER_THREAD_BLOCK(T) \
-	switch (q_heads_per_thread_block) {	\
+#define FUSED_DECODING_STAGE_ATTENTION_DISPATCH_Q_HEADS_PER_KV_HEAD(T) \
+	switch (q_heads_per_kv_head) {	\
 		case 1: FUSED_DECODING_STAGE_ATTENTION_DISPATCH_HEAD_DIM(T, 1); break;	\
 		case 2: FUSED_DECODING_STAGE_ATTENTION_DISPATCH_HEAD_DIM(T, 2); break;	\
-		/*case 4: FUSED_DECODING_STAGE_ATTENTION_DISPATCH_HEAD_DIM(T, 4); break;*/	\
-		/*case 8: FUSED_DECODING_STAGE_ATTENTION_DISPATCH_HEAD_DIM(T, 8); break;*/	\
-		default: fprintf(stderr, "Unsupported q_heads_per_thread_block: %ld\n", q_heads_per_thread_block); assert(0);	\
+		case 4: FUSED_DECODING_STAGE_ATTENTION_DISPATCH_HEAD_DIM(T, 4); break;	\
+		case 8: FUSED_DECODING_STAGE_ATTENTION_DISPATCH_HEAD_DIM(T, 8); break;	\
+		default: fprintf(stderr, "Unsupported q_heads_per_kv_head: %ld\n", q_heads_per_kv_head); assert(0);	\
 	}
 
 template<typename T>
@@ -315,11 +366,12 @@ void fusedDecodingStageAttention(
 		);
 		return;
 	}
-	int64_t q_heads_per_thread_block = 2;	// TODO Tune this
+	int64_t q_heads_per_kv_head = num_q_heads / num_kv_heads;
 	T* k_cache_offseted = k_cache + layer_id * num_kv_heads * block_size * head_dim;
 	T* v_cache_offseted = v_cache + layer_id * num_kv_heads * block_size * head_dim;
-	dim3 grid_dim(num_q_heads/q_heads_per_thread_block, num_decoding_reqs);
-	FUSED_DECODING_STAGE_ATTENTION_DISPATCH_Q_HEADS_PER_THREAD_BLOCK(T);
+	dim3 grid_dim(num_q_heads, num_decoding_reqs);
+	int shared_mem_size = std::max(((max_decoding_req_len+1 + block_size-1) / block_size) * block_size * sizeof(float), DEFAULT_THREAD_BLOCK_SIZE*2*sizeof(T));
+	FUSED_DECODING_STAGE_ATTENTION_DISPATCH_Q_HEADS_PER_KV_HEAD(T);
 }
 
 #define INSTANTIATE_FUSED_DECODING_STAGE_ATTENTION(T) \
