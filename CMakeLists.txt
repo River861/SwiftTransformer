@@ -10,8 +10,7 @@ if (DEFINED ENV{CONDA_PREFIX})
   set(CUDAToolkit_ROOT $ENV{CONDA_PREFIX})
 endif()
 
-set(CMAKE_PREFIX_PATH "/usr/local/cuda-12.1" ${CMAKE_PREFIX_PATH})
-find_package(CUDAToolkit 11.4 REQUIRED)
+find_package(CUDA 11.4 REQUIRED)
 
 # gcc >= 8 is required, we do not support other compilers
 if ((NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU") OR (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 8.0))
