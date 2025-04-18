@@ -10,6 +10,9 @@ if (DEFINED ENV{CONDA_PREFIX})
   set(CUDAToolkit_ROOT $ENV{CONDA_PREFIX})
 endif()
 
+if (NOT DEFINED ENV{CUDAToolkit_DIR})
+  set(CUDAToolkit_DIR "/usr/local/cuda" CACHE PATH "Path to CUDA Toolkit")
+endif()
 find_package(CUDAToolkit 11.4 REQUIRED)
 
 # gcc >= 8 is required, we do not support other compilers
