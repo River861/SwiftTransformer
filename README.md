@@ -16,7 +16,7 @@ If you want to build your own project on top of SwiftTransformer, please follow 
 
 ```shell
 # setup and activate the conda environment
-conda env create -f environment.yml && conda activate SwiftTransformer
+conda env create -f environment.yml && conda activate distserve
 
 # build SwiftTransformer
 cmake -B build && cmake --build build -j$(nproc)
