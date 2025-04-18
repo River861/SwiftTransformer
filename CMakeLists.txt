@@ -7,7 +7,7 @@ if (DEFINED ENV{CONDA_PREFIX})
   include_directories($ENV{CONDA_PREFIX}/include)
   set(CMAKE_PREFIX_PATH $ENV{CONDA_PREFIX} ${CMAKE_PREFIX_PATH})
   # set(CMAKE_CUDA_COMPILER $ENV{CONDA_PREFIX}/bin/nvcc)
-  set(CUDAToolkit_ROOT $ENV{CONDA_PREFIX})
+  # set(CUDAToolkit_ROOT $ENV{CONDA_PREFIX})
 endif()
 
 find_package(CUDA 11.4 REQUIRED)
