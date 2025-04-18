@@ -6,7 +6,7 @@ if (DEFINED ENV{CONDA_PREFIX})
   link_directories($ENV{CONDA_PREFIX}/lib)
   include_directories($ENV{CONDA_PREFIX}/include)
   set(CMAKE_PREFIX_PATH $ENV{CONDA_PREFIX} ${CMAKE_PREFIX_PATH})
-  set(CMAKE_CUDA_COMPILER $ENV{CONDA_PREFIX}/bin/nvcc)
+  # set(CMAKE_CUDA_COMPILER $ENV{CONDA_PREFIX}/bin/nvcc)
   set(CUDAToolkit_ROOT $ENV{CONDA_PREFIX})
 endif()
 
