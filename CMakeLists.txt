@@ -10,7 +10,7 @@ if (DEFINED ENV{CONDA_PREFIX})
   set(CUDAToolkit_ROOT $ENV{CONDA_PREFIX})
 endif()
 
-find_package(CUDAToolkit 12.1 REQUIRED)
+find_package(CUDAToolkit 11.4 REQUIRED)
 
 # gcc >= 8 is required, we do not support other compilers
 if ((NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU") OR (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 8.0))
